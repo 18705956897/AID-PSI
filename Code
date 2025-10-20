@@ -1,1 +1,1090 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from PIL import Image
+from matplotlib.widgets import Button, RadioButtons, RectangleSelector
+import time
+import math
+from scipy.ndimage import gaussian_filter
+import tkinter as tk
+from tkinter import filedialog
+import re
 
+
+# -------------------------- Global Configuration Class --------------------------
+class Config:
+    def __init__(self):
+        # Path and file configuration
+        self.img_folder = ""
+        self.qe_data_path = "QE Distribution Data.npz"
+        self.result_save_path = ""
+
+        # Reconstruction parameters
+        self.sr_factor = 4  # 2/3/4x pixel segmentation
+        self.start_num = 1
+        self.end_num = 16
+        self.ref_frame_idx = 6  # Reference frame index
+        self.roi = [0, 0, 200, 200]  # [x, y, w, h]
+
+        # Evolutionary algorithm parameters
+        self.pop_size = 100
+        self.max_iter = 100
+        self.CR = 0.9  # Fixed crossover rate
+        self.F = 0.5
+        self.stride = 0.1
+
+        # Post-processing parameters
+        self.border_threshold = 1  # Border clipping switch (1=enabled)
+        self.gaussian_filter = 1  # Gaussian filtering switch (1=enabled)
+        self.gs_sigma = 1.0
+        self.fgs_sigma = 0.75
+
+        # Status information
+        self.status = "Ready: Please load image data"
+        self.processing_time = 0.0
+
+
+# Initialize configuration
+config = Config()
+
+
+# -------------------------- Data Processing Utility Class --------------------------
+class DataProcessor:
+    @staticmethod
+    def load_image(path, normalize=False):
+        """Load image and convert to PyTorch tensor"""
+        try:
+            img = Image.open(path).convert('L')  # Convert to grayscale
+            img_tensor = torch.tensor(np.array(img), dtype=torch.float32)
+            if normalize:
+                img_tensor = (img_tensor - img_tensor.min()) / (img_tensor.max() - img_tensor.min() + 1e-8)
+            return img_tensor
+        except Exception as e:
+            print(f"Image loading failed: {e}")
+            return None
+
+    @staticmethod
+    def save_image(tensor, path, dtype=np.uint16):
+        """Save tensor as image file"""
+        try:
+            img_np = tensor.numpy().astype(dtype)
+            Image.fromarray(img_np).save(path)
+            return True
+        except Exception as e:
+            print(f"Image saving failed: {e}")
+            return False
+
+    @staticmethod
+    def crop_image(img, roi):
+        """Crop ROI region [x, y, w, h]"""
+        x, y, w, h = roi
+        h_max, w_max = img.shape[-2], img.shape[-1]
+        x = max(0, min(x, w_max - 1))
+        y = max(0, min(y, h_max - 1))
+        w = min(w, w_max - x)
+        h = min(h, h_max - y)
+        return img[..., y:y + h, x:x + w]
+
+    @staticmethod
+    def resize_image(img, scale_factor, mode='bilinear'):
+        """Resize image"""
+        if img.ndim == 2:
+            img = img.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        elif img.ndim == 3:
+            img = img.unsqueeze(0)  # [1, C, H, W]
+        resized = F.interpolate(
+            img,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=True
+        )
+        return resized.squeeze()
+
+    @staticmethod
+    def natural_sort(lst):
+        """Natural sorting (numbers sorted by value)"""
+
+        def convert(text):
+            return int(text) if text.isdigit() else text.lower()
+
+        def alphanum_key(key):
+            return [convert(c) for c in re.split('([0-9]+)', str(key))]
+
+        return sorted(lst, key=alphanum_key)
+
+
+# -------------------------- QE Data Handling Class --------------------------
+class QEDataHandler:
+    def __init__(self):
+        self.qe_brightness = {}  # Brightness component {scale_factor: data}
+        self.qe_contrast = {}  # Contrast component {scale_factor: data}
+        self.loaded = False
+
+    def load_qe_data(self):
+        """Load QE distribution data"""
+        try:
+            if not os.path.exists(config.qe_data_path):
+                print(f"QE data file not found: {config.qe_data_path}, generating simulated data")
+                self.generate_simulated_qe_data()
+            else:
+                data = np.load(config.qe_data_path)
+                self.qe_brightness[4] = torch.tensor(data['brightness_4x'], dtype=torch.float32)
+                self.qe_contrast[4] = torch.tensor(data['contrast_4x'], dtype=torch.float32)
+                self.qe_brightness[3] = torch.tensor(data['brightness_3x'], dtype=torch.float32)
+                self.qe_contrast[3] = torch.tensor(data['contrast_3x'], dtype=torch.float32)
+                self.qe_brightness[2] = torch.tensor(data['brightness_2x'], dtype=torch.float32)
+                self.qe_contrast[2] = torch.tensor(data['contrast_2x'], dtype=torch.float32)
+            self.loaded = True
+            return True
+        except Exception as e:
+            print(f"QE data loading failed: {e}, generating simulated data")
+            self.generate_simulated_qe_data()
+            self.loaded = True
+            return True
+
+    def generate_simulated_qe_data(self):
+        """Generate simulated QE data"""
+        sizes = {4: (1024, 1024), 3: (768, 768), 2: (512, 512)}
+        for factor in sizes:
+            h, w = sizes[factor]
+            # Generate base pattern with random noise
+            x = torch.linspace(0, 1, w)
+            y = torch.linspace(0, 1, h)
+            xx, yy = torch.meshgrid(x, y, indexing='xy')
+            base_pattern = 0.5 + 0.2 * torch.sin(xx * math.pi * 4) * torch.cos(yy * math.pi * 4)
+            noise = torch.randn(h, w) * 0.05
+            self.qe_brightness[factor] = base_pattern + noise
+            self.qe_contrast[factor] = 0.2 + 0.1 * torch.rand(h, w)
+
+    def get_qe_patch(self, factor, pos, size):
+        """Get QE data patch at specified position and size"""
+        if not self.loaded:
+            self.load_qe_data()
+
+        n, m = pos  # Original image position
+        patch_h, patch_w = size  # Patch size
+
+        # Calculate position in QE data
+        qe_h, qe_w = self.qe_brightness[factor].shape
+        start_y = min(max(0, (n - 1) * factor), qe_h - patch_h)
+        start_x = min(max(0, (m - 1) * factor), qe_w - patch_w)
+
+        # Extract brightness and contrast components
+        bright_patch = self.qe_brightness[factor][start_y:start_y + patch_h, start_x:start_x + patch_w]
+        contrast_patch = self.qe_contrast[factor][start_y:start_y + patch_h, start_x:start_x + patch_w]
+
+        return bright_patch, contrast_patch
+
+
+# -------------------------- Evolutionary Algorithm Implementation --------------------------
+class EvolutionaryAlgorithm:
+    def __init__(self, obj_func, x_min, x_max):
+        self.obj_func = obj_func
+        self.x_min = torch.tensor(x_min, dtype=torch.float32)
+        self.x_max = torch.tensor(x_max, dtype=torch.float32)
+        self.dim = len(x_min)
+
+        # Population and fitness
+        self.population = None
+        self.fitness = None
+
+        # Best solution
+        self.best_solution = None
+        self.best_fitness = -float('inf')
+
+    def initialize_population(self):
+        """Step1: Population initialization"""
+        self.population = torch.zeros((config.pop_size, self.dim))
+        for i in range(config.pop_size):
+            for j in range(self.dim):
+                self.population[i, j] = self.x_min[j] + torch.rand(1) * (self.x_max[j] - self.x_min[j])
+        self.evaluate_population()
+        self.update_best_solution()
+
+    def evaluate_population(self):
+        """Step2: Individual evaluation"""
+        self.fitness = torch.zeros(config.pop_size)
+        for i in range(config.pop_size):
+            self.fitness[i] = self.obj_func(self.population[i])
+
+    def update_best_solution(self):
+        """Update best solution"""
+        current_best_idx = torch.argmax(self.fitness)
+        current_best_fitness = self.fitness[current_best_idx]
+        if current_best_fitness > self.best_fitness:
+            self.best_fitness = current_best_fitness
+            self.best_solution = self.population[current_best_idx].clone()
+
+    def neighborhood_search(self, individual):
+        """Step4: Neighborhood search (Basin Hopping)"""
+        neighbor = individual + config.stride * torch.randn_like(individual)
+        return torch.clamp(neighbor, self.x_min, self.x_max)
+
+    def crossover(self, individual):
+        """Step5: Crossover operation"""
+        # Select two high-fitness parents
+        sorted_indices = torch.argsort(self.fitness, descending=True)
+        p1_idx = sorted_indices[torch.randint(0, min(5, config.pop_size), (1,))]
+        p2_idx = sorted_indices[torch.randint(0, min(5, config.pop_size), (1,))]
+        while p1_idx == p2_idx:
+            p2_idx = sorted_indices[torch.randint(0, min(5, config.pop_size), (1,))]
+
+        parent1 = self.population[p1_idx]
+        parent2 = self.population[p2_idx]
+
+        # Perform crossover
+        child = individual.clone()
+        for j in range(self.dim):
+            if torch.rand(1) < config.CR:
+                child[j] = parent1[j] + torch.rand(1) * (parent2[j] - parent1[j])
+        return torch.clamp(child, self.x_min, self.x_max)
+
+    def mutate(self, individual):
+        """Step6: Mutation operation"""
+        k, l = torch.randint(0, config.pop_size, (2,))
+        while k == l:
+            l = torch.randint(0, config.pop_size, (1,))
+        return individual + config.F * (self.population[k] - self.population[l])
+
+    def optimize(self, progress_callback=None):
+        """Main optimization process"""
+        self.initialize_population()
+
+        for gen in range(config.max_iter):
+            # Step3: Termination condition check
+            if self.best_fitness > 0.99:
+                break
+
+            new_population = self.population.clone()
+            new_fitness = self.fitness.clone()
+
+            for i in range(config.pop_size):
+                # Current individual
+                current_ind = self.population[i].clone()
+                current_fit = self.fitness[i]
+
+                # Neighborhood search
+                neighbor = self.neighborhood_search(current_ind)
+                neighbor_fit = self.obj_func(neighbor)
+                if neighbor_fit > current_fit:
+                    current_ind, current_fit = neighbor, neighbor_fit
+
+                # Crossover operation
+                child = self.crossover(current_ind)
+                child_fit = self.obj_func(child)
+                if child_fit > current_fit:
+                    current_ind, current_fit = child, child_fit
+
+                # Mutation operation
+                mutant = self.mutate(current_ind)
+                mutant_fit = self.obj_func(mutant)
+                if mutant_fit > current_fit:
+                    current_ind, current_fit = mutant, mutant_fit
+
+                # Step7: Selection operation
+                new_population[i] = current_ind
+                new_fitness[i] = current_fit
+
+            # Update population
+            self.population = new_population
+            self.fitness = new_fitness
+            self.update_best_solution()
+
+            # Progress callback
+            if progress_callback and (gen + 1) % 10 == 0:
+                progress = (gen + 1) / config.max_iter * 100
+                progress_callback(progress)
+
+        return self.best_solution, self.best_fitness
+
+
+# -------------------------- Displacement Calculation Class --------------------------
+class DisplacementCalculator:
+    def __init__(self):
+        self.displacements = None  # Store frame displacements [dx, dy]
+        self.ccr_values = None  # Store cross-correlation coefficients
+
+    def calculate_ccr(self, img1, img2):
+        """Calculate Cross-Correlation Coefficient (CCR)"""
+        img1_norm = (img1 - img1.mean()) / (img1.std() + 1e-8)
+        img2_norm = (img2 - img2.mean()) / (img2.std() + 1e-8)
+        return torch.mean(img1_norm * img2_norm)
+
+    def find_best_match(self, ref_img, target_img, search_window=10):
+        """Find best matching position within search window"""
+        h, w = ref_img.shape
+        max_ccr = -float('inf')
+        best_dx, best_dy = 0, 0
+
+        # Slide within search window
+        for dy in range(-search_window, search_window + 1):
+            for dx in range(-search_window, search_window + 1):
+                # Calculate shifted image
+                shifted = torch.roll(target_img, shifts=(dy, dx), dims=(0, 1))
+                # Calculate CCR for overlapping region
+                ccr = self.calculate_ccr(ref_img, shifted)
+                if ccr > max_ccr:
+                    max_ccr = ccr
+                    best_dx, best_dy = dx, dy
+
+        return best_dx, best_dy, max_ccr
+
+    def calculate_all_displacements(self, img_array, ref_idx=0):
+        """Calculate displacements of all frames relative to reference frame"""
+        num_frames, h, w = img_array.shape
+        self.displacements = torch.zeros(num_frames, 2)
+        self.ccr_values = torch.zeros(num_frames)
+        ref_img = img_array[ref_idx]
+
+        for i in range(num_frames):
+            if i == ref_idx:
+                self.displacements[i] = torch.tensor([0.0, 0.0])
+                self.ccr_values[i] = 1.0
+                continue
+
+            dx, dy, ccr = self.find_best_match(ref_img, img_array[i])
+            self.displacements[i] = torch.tensor([dx, dy])
+            self.ccr_values[i] = ccr
+
+        return self.displacements
+
+
+# -------------------------- PSI Reconstruction Core Class --------------------------
+class PSIReconstructor:
+    def __init__(self):
+        # Data storage
+        self.img_files = []
+        self.img_array = None  # [N, H, W]
+        self.ref_img = None  # Reference image
+        self.index_array = None  # Displacement indices
+
+        # Processing tools
+        self.data_processor = DataProcessor()
+        self.qe_handler = QEDataHandler()
+        self.displacement_calc = DisplacementCalculator()
+
+        # Result storage
+        self.psi_result = None
+        self.init_guess = None  # Initial guess values
+
+    def load_image_sequence(self, folder_path):
+        """Load image sequence"""
+        config.img_folder = folder_path
+        # Get all image files
+        self.img_files = [
+            f for f in os.listdir(folder_path)
+            if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg'))
+        ]
+        self.img_files = self.data_processor.natural_sort(self.img_files)
+
+        if not self.img_files:
+            raise ValueError("No image files found")
+
+        # Load image sequence
+        img_list = []
+        for f in self.img_files:
+            img_path = os.path.join(folder_path, f)
+            img = self.data_processor.load_image(img_path)
+            if img is not None:
+                img_list.append(img)
+
+        # Crop ROI
+        self.img_array = torch.stack(img_list, dim=0)
+        self.img_array = self.data_processor.crop_image(self.img_array, config.roi)
+        self.ref_img = self.img_array[config.ref_frame_idx].clone()
+
+        return self.img_array.shape[1], self.img_array.shape[2]  # H, W
+
+    def prepare_initial_guess(self, h, w):
+        """Prepare initial guess (multi-frame average)"""
+        factor = config.sr_factor
+        self.init_guess = torch.zeros(h * factor, w * factor)
+
+        # Average after upsampling each frame
+        for i in range(self.img_array.shape[0]):
+            upsampled = self.data_processor.resize_image(self.img_array[i], factor)
+            self.init_guess += upsampled
+
+        self.init_guess /= self.img_array.shape[0]
+
+        # Remove extreme value influence
+        max_val = torch.mean(self.init_guess) + 3 * torch.std(self.init_guess)
+        min_val = torch.mean(self.init_guess) - 3 * torch.std(self.init_guess)
+        self.init_guess = torch.clamp(self.init_guess, min_val, max_val)
+
+        return self.init_guess
+
+    def reconstruct_4x(self, h, w, progress_callback=None):
+        """4x pixel segmentation reconstruction"""
+        factor = 4
+        self.psi_result = torch.zeros(h * factor, w * factor)
+        total_patches = h * w
+        completed = 0
+
+        # Prepare initial guess
+        self.prepare_initial_guess(h, w)
+
+        # Process pixel by pixel
+        for n in range(1, h + 1):
+            for m in range(1, w + 1):
+                # 1. Extract multi-frame observations at current position
+                I = []
+                for num in range(config.start_num, config.end_num + 1):
+                    # Calculate observation value for current frame (original pixel value × factor²)
+                    frame_idx = num - 1  # Convert to 0-based index
+                    if frame_idx >= self.img_array.shape[0]:
+                        continue
+
+                    # Get displacement information
+                    dx, dy = self.index_array[frame_idx]
+                    # Calculate corresponding position
+                    pos_n = min(max(n + int(dy), 1), h)
+                    pos_m = min(max(m + int(dx), 1), w)
+                    # Extract observation value
+                    obs_value = self.img_array[frame_idx, pos_n - 1, pos_m - 1] * (factor ** 2)
+                    I.append(obs_value)
+                I = torch.tensor(I)
+
+                # 2. Extract QE data patch and build feature matrix xl4b
+                xl4b = []
+                for num in range(config.start_num, config.end_num + 1):
+                    frame_idx = num - 1
+                    if frame_idx >= self.img_array.shape[0]:
+                        continue
+
+                    # Get QE brightness and contrast components
+                    bright_patch, contrast_patch = self.qe_handler.get_qe_patch(
+                        factor, (n, m), (factor, factor)
+                    )
+
+                    # Extract features (corresponding to original MATLAB code structure)
+                    row1 = bright_patch[0, :]  # Row 4*n-3
+                    row2 = bright_patch[1, :]  # Row 4*n-2
+                    row3 = bright_patch[2, :]  # Row 4*n-1
+                    row4 = bright_patch[3, :]  # Row 4*n
+
+                    c_row1 = contrast_patch[0, :]  # Row 4*n-3
+                    c_row2 = contrast_patch[1, :]  # Row 4*n-2
+                    c_row3 = contrast_patch[2, :]  # Row 4*n-1
+                    c_row4 = contrast_patch[3, :]  # Row 4*n
+
+                    # Build feature vector (consistent with original xl4b structure)
+                    features = torch.cat([
+                        row1, row2, row3, row4,
+                        c_row1, c_row2, c_row3, c_row4
+                    ])
+                    xl4b.append(features)
+                xl4b = torch.stack(xl4b)
+
+                # 3. Define nonlinear model and fitness function
+                def model_func(x, s):
+                    # x: [16] parameters to optimize
+                    # s: [32] feature vector
+                    linear_term = (
+                            x[0] * s[:, 0] + x[1] * s[:, 1] + x[2] * s[:, 2] + x[3] * s[:, 3] +
+                            x[4] * s[:, 4] + x[5] * s[:, 5] + x[6] * s[:, 6] + x[7] * s[:, 7] +
+                            x[8] * s[:, 8] + x[9] * s[:, 9] + x[10] * s[:, 10] + x[11] * s[:, 11] +
+                            x[12] * s[:, 12] + x[13] * s[:, 13] + x[14] * s[:, 14] + x[15] * s[:, 15]
+                    )
+                    quadratic_term = (
+                            x[0] ** 2 * s[:, 16] + x[1] ** 2 * s[:, 17] + x[2] ** 2 * s[:, 18] + x[3] ** 2 * s[:, 19] +
+                            x[4] ** 2 * s[:, 20] + x[5] ** 2 * s[:, 21] + x[6] ** 2 * s[:, 22] + x[7] ** 2 * s[:, 23] +
+                            x[8] ** 2 * s[:, 24] + x[9] ** 2 * s[:, 25] + x[10] ** 2 * s[:, 26] + x[11] ** 2 * s[:,
+                                                                                                               27] +
+                            x[12] ** 2 * s[:, 28] + x[13] ** 2 * s[:, 29] + x[14] ** 2 * s[:, 30] + x[15] ** 2 * s[:,
+                                                                                                                 31]
+                    )
+                    return linear_term + quadratic_term
+
+                def obj_func(x):
+                    pred = model_func(x, xl4b)
+                    loss = torch.sum((pred - I) ** 2)
+                    return 1.0 / (1.0 + loss)  # Higher fitness for smaller error
+
+                # 4. Set initial point and parameter boundaries
+                start_row = (n - 1) * factor
+                start_col = (m - 1) * factor
+                start_point = self.init_guess[
+                              start_row:start_row + factor,
+                              start_col:start_col + factor
+                              ].flatten()
+
+                x_min = (start_point - 10).tolist()
+                x_max = (start_point + 10).tolist()
+
+                # 5. Evolutionary algorithm optimization
+                optimizer = EvolutionaryAlgorithm(obj_func, x_min, x_max)
+                best_params, _ = optimizer.optimize()
+
+                # 6. Update reconstruction result
+                self.psi_result[
+                start_row:start_row + factor,
+                start_col:start_col + factor
+                ] = best_params.reshape(factor, factor)
+
+                # Update progress
+                completed += 1
+                if progress_callback and completed % 10 == 0:
+                    progress = (completed / total_patches) * 100
+                    progress_callback(progress)
+
+        return self.psi_result
+
+    def reconstruct_3x(self, h, w, progress_callback=None):
+        """3x pixel segmentation reconstruction"""
+        factor = 3
+        self.psi_result = torch.zeros(h * factor, w * factor)
+        total_patches = h * w
+        completed = 0
+
+        # Prepare initial guess
+        self.prepare_initial_guess(h, w)
+
+        # Process pixel by pixel
+        for n in range(1, h + 1):
+            for m in range(1, w + 1):
+                # 1. Extract multi-frame observations at current position
+                I = []
+                for num in range(config.start_num, config.end_num + 1):
+                    frame_idx = num - 1
+                    if frame_idx >= self.img_array.shape[0]:
+                        continue
+
+                    dx, dy = self.index_array[frame_idx]
+                    pos_n = min(max(n + int(dy), 1), h)
+                    pos_m = min(max(m + int(dx), 1), w)
+                    obs_value = self.img_array[frame_idx, pos_n - 1, pos_m - 1] * (factor ** 2)
+                    I.append(obs_value)
+                I = torch.tensor(I)
+
+                # 2. Extract QE data patch and build feature matrix xl3b
+                xl3b = []
+                for num in range(config.start_num, config.end_num + 1):
+                    frame_idx = num - 1
+                    if frame_idx >= self.img_array.shape[0]:
+                        continue
+
+                    bright_patch, contrast_patch = self.qe_handler.get_qe_patch(
+                        factor, (n, m), (factor, factor)
+                    )
+
+                    # Extract features (corresponding to original MATLAB code structure)
+                    row1 = bright_patch[0, :]  # Row 3*n-2
+                    row2 = bright_patch[1, :]  # Row 3*n-1
+                    row3 = bright_patch[2, :]  # Row 3*n
+
+                    c_row1 = contrast_patch[0, :]  # Row 3*n-2
+                    c_row2 = contrast_patch[1, :]  # Row 3*n-1
+                    c_row3 = contrast_patch[2, :]  # Row 3*n
+
+                    # Build feature vector (consistent with original xl3b structure)
+                    features = torch.cat([
+                        row1, row2, row3,
+                        c_row1, c_row2, c_row3
+                    ])
+                    xl3b.append(features)
+                xl3b = torch.stack(xl3b)
+
+                # 3. Define nonlinear model and fitness function
+                def model_func(x, s):
+                    # x: [9] parameters to optimize
+                    linear_term = (
+                            x[0] * s[:, 0] + x[1] * s[:, 1] + x[2] * s[:, 2] +
+                            x[3] * s[:, 3] + x[4] * s[:, 4] + x[5] * s[:, 5] +
+                            x[6] * s[:, 6] + x[7] * s[:, 7] + x[8] * s[:, 8]
+                    )
+                    quadratic_term = (
+                            x[0] ** 2 * s[:, 9] + x[1] ** 2 * s[:, 10] + x[2] ** 2 * s[:, 11] +
+                            x[3] ** 2 * s[:, 12] + x[4] ** 2 * s[:, 13] + x[5] ** 2 * s[:, 14] +
+                            x[6] ** 2 * s[:, 15] + x[7] ** 2 * s[:, 16] + x[8] ** 2 * s[:, 17]
+                    )
+                    return linear_term + quadratic_term
+
+                def obj_func(x):
+                    pred = model_func(x, xl3b)
+                    loss = torch.sum((pred - I) ** 2)
+                    return 1.0 / (1.0 + loss)
+
+                # 4. Set initial point and parameter boundaries
+                start_row = (n - 1) * factor
+                start_col = (m - 1) * factor
+                start_point = self.init_guess[
+                              start_row:start_row + factor,
+                              start_col:start_col + factor
+                              ].flatten()
+
+                x_min = (start_point - 100).tolist()
+                x_max = (start_point + 100).tolist()
+
+                # 5. Evolutionary algorithm optimization
+                optimizer = EvolutionaryAlgorithm(obj_func, x_min, x_max)
+                best_params, _ = optimizer.optimize()
+
+                # 6. Update reconstruction result
+                self.psi_result[
+                start_row:start_row + factor,
+                start_col:start_col + factor
+                ] = best_params.reshape(factor, factor)
+
+                # Update progress
+                completed += 1
+                if progress_callback and completed % 10 == 0:
+                    progress = (completed / total_patches) * 100
+                    progress_callback(progress)
+
+        return self.psi_result
+
+    def reconstruct_2x(self, h, w, progress_callback=None):
+        """2x pixel segmentation reconstruction"""
+        factor = 2
+        self.psi_result = torch.zeros(h * factor, w * factor)
+        total_patches = h * w
+        completed = 0
+
+        # Prepare initial guess
+        self.prepare_initial_guess(h, w)
+
+        # Process pixel by pixel
+        for n in range(1, h + 1):
+            for m in range(1, w + 1):
+                # 1. Extract multi-frame observations at current position
+                I = []
+                for num in range(config.start_num, config.end_num + 1):
+                    frame_idx = num - 1
+                    if frame_idx >= self.img_array.shape[0]:
+                        continue
+
+                    dx, dy = self.index_array[frame_idx]
+                    pos_n = min(max(n + int(dy), 1), h)
+                    pos_m = min(max(m + int(dx), 1), w)
+                    obs_value = self.img_array[frame_idx, pos_n - 1, pos_m - 1] * (factor ** 2)
+                    I.append(obs_value)
+                I = torch.tensor(I)
+
+                # 2. Extract QE data patch and build feature matrix xl2b (corresponding to original MATLAB code)
+                xl2b = []
+                for num in range(config.start_num, config.end_num + 1):
+                    frame_idx = num - 1
+                    if frame_idx >= self.img_array.shape[0]:
+                        continue
+
+                    bright_patch, contrast_patch = self.qe_handler.get_qe_patch(
+                        factor, (n, m), (factor, factor)
+                    )
+
+                    # Extract features (strictly corresponding to original MATLAB code structure)
+                    row1 = bright_patch[0, :]  # Row 2*n-1
+                    row2 = bright_patch[1, :]  # Row 2*n
+
+                    c_row1 = contrast_patch[0, :]  # Row 2*n-1
+                    c_row2 = contrast_patch[1, :]  # Row 2*n
+
+                    # Build feature vector (consistent with original xl2b structure)
+                    features = torch.cat([
+                        row1,  # xl2b(num,1:2)
+                        row2,  # xl2b(num,3:4)
+                        c_row1,  # xl2b(num,5:6)
+                        c_row2  # xl2b(num,7:8)
+                    ])
+                    xl2b.append(features)
+                xl2b = torch.stack(xl2b)
+
+                # 3. Define nonlinear model and fitness function (strictly corresponding to original MATLAB code)
+                def model_func(x, s):
+                    # x: [4] parameters to optimize
+                    # Linear term: x(1)*s(:,1)+x(2)*s(:,2)+x(3)*s(:,3)+x(4)*s(:,4)
+                    linear_term = (
+                            x[0] * s[:, 0] + x[1] * s[:, 1] +
+                            x[2] * s[:, 2] + x[3] * s[:, 3]
+                    )
+                    # Quadratic term: x(1)^2*s(:,5)+x(2)^2*s(:,6)+x(3)^2*s(:,7)+x(4)^2*s(:,8)
+                    quadratic_term = (
+                            x[0] ** 2 * s[:, 4] + x[1] ** 2 * s[:, 5] +
+                            x[2] ** 2 * s[:, 6] + x[3] ** 2 * s[:, 7]
+                    )
+                    return linear_term + quadratic_term
+
+                # Fitness function: higher fitness for smaller error
+                def obj_func(x):
+                    pred = model_func(x, xl2b)
+                    loss = torch.sum((pred - I) ** 2)
+                    return 1.0 / (1.0 + loss)
+
+                # 4. Set initial point and parameter boundaries
+                start_row = (n - 1) * factor
+                start_col = (m - 1) * factor
+                start_point = self.init_guess[
+                              start_row:start_row + factor,
+                              start_col:start_col + factor
+                              ].flatten()
+
+                x_min = (start_point - 100).tolist()
+                x_max = (start_point + 100).tolist()
+
+                # 5. Evolutionary algorithm optimization
+                optimizer = EvolutionaryAlgorithm(obj_func, x_min, x_max)
+                best_params, _ = optimizer.optimize()
+
+                # 6. Update reconstruction result
+                self.psi_result[
+                start_row:start_row + factor,
+                start_col:start_col + factor
+                ] = best_params.reshape(factor, factor)
+
+                # Update progress
+                completed += 1
+                if progress_callback and completed % 10 == 0:
+                    progress = (completed / total_patches) * 100
+                    progress_callback(progress)
+
+        return self.psi_result
+
+    def post_processing(self):
+        """Post-processing: border clipping and filtering"""
+        if self.psi_result is None:
+            return
+
+        # Border clipping
+        if config.border_threshold:
+            max_val = self.psi_result.max()
+            min_val = self.psi_result.min()
+
+            if config.sr_factor == 4:
+                self.psi_result = torch.clamp(self.psi_result, min_val - 300, max_val + 600)
+            elif config.sr_factor == 3:
+                self.psi_result = torch.clamp(self.psi_result, min_val - 500, max_val + 600)
+            else:  # 2x
+                self.psi_result = torch.clamp(self.psi_result, min_val - 500, max_val + 2000)
+
+        # Gaussian filtering
+        if config.gaussian_filter:
+            # Convert to numpy for filtering
+            result_np = self.psi_result.numpy()
+            # Gaussian filter
+            result_np = gaussian_filter(result_np, sigma=config.gs_sigma)
+            # Fine filtering fgauss
+            result_np = (result_np - config.fgs_sigma * gaussian_filter(result_np, sigma=1)) / (1 - config.fgs_sigma)
+            self.psi_result = torch.tensor(result_np)
+
+    def run_reconstruction(self, progress_callback=None):
+        """Execute complete reconstruction process"""
+        start_time = time.time()
+
+        try:
+            # 1. Load data
+            if not config.img_folder:
+                raise ValueError("Please select image folder first")
+
+            h, w = self.load_image_sequence(config.img_folder)
+
+            # 2. Calculate displacements
+            self.index_array = self.displacement_calc.calculate_all_displacements(
+                self.img_array, config.ref_frame_idx
+            )
+
+            # 3. Load QE data
+            self.qe_handler.load_qe_data()
+
+            # 4. Select corresponding reconstruction function based on scaling factor
+            if config.sr_factor == 4:
+                self.reconstruct_4x(h, w, progress_callback)
+            elif config.sr_factor == 3:
+                self.reconstruct_3x(h, w, progress_callback)
+            else:
+                self.reconstruct_2x(h, w, progress_callback)
+
+            # 5. Post-processing
+            self.post_processing()
+
+            # 6. Calculate processing time
+            config.processing_time = time.time() - start_time
+            return self.psi_result
+
+        except Exception as e:
+            print(f"Reconstruction failed: {e}")
+            return None
+
+
+# -------------------------- GUI Interface Class --------------------------
+class PSIGUI:
+    def __init__(self):
+        self.reconstructor = PSIReconstructor()
+        self.roi_selector = None
+        self.init_ui()
+
+    def init_ui(self):
+        """Initialize GUI interface"""
+        plt.rcParams["font.family"] = ["Arial", "Helvetica", "sans-serif"]
+        plt.rcParams["axes.unicode_minus"] = False
+
+        # Create main window
+        self.fig = plt.figure(figsize=(15, 10))
+        self.fig.canvas.manager.set_window_title("Pixel Segmentation Reconstruction (PSI) System")
+
+        # Create subplots
+        self.ax_original = self.fig.add_subplot(221)
+        self.ax_roi = self.fig.add_subplot(222)
+        self.ax_displacement = self.fig.add_subplot(223)
+        self.ax_result = self.fig.add_subplot(224)
+
+        # Set subplot titles
+        self.ax_original.set_title("Original Reference Image")
+        self.ax_roi.set_title("ROI Region")
+        self.ax_displacement.set_title("Inter-frame Displacement")
+        self.ax_result.set_title("PSI Reconstruction Result")
+
+        # Status display area
+        self.ax_status = self.fig.add_axes([0.1, 0.01, 0.8, 0.03])
+        self.ax_status.axis('off')
+        self.status_text = self.ax_status.text(0, 0.5, config.status,
+                                               verticalalignment='center', fontsize=10)
+
+        # Progress bar
+        self.ax_progress = self.fig.add_axes([0.1, 0.05, 0.8, 0.02])
+        self.ax_progress.axis('off')
+        self.progress_bar = plt.Rectangle((0, 0), 0, 1, fc='green')
+        self.ax_progress.add_patch(self.progress_bar)
+
+        # Button area
+        btn_y = 0.1
+        btn_height = 0.03
+        btn_width = 0.15
+
+        # Load images button
+        self.ax_btn_load = self.fig.add_axes([0.1, btn_y, btn_width, btn_height])
+        self.btn_load = Button(self.ax_btn_load, 'Load Image Sequence')
+        self.btn_load.on_clicked(self.on_load_images)
+
+        # Select ROI button
+        self.ax_btn_roi = self.fig.add_axes([0.3, btn_y, btn_width, btn_height])
+        self.btn_roi = Button(self.ax_btn_roi, 'Select ROI Region')
+        self.btn_roi.on_clicked(self.on_select_roi)
+
+        # Calculate displacement button
+        self.ax_btn_disp = self.fig.add_axes([0.5, btn_y, btn_width, btn_height])
+        self.btn_disp = Button(self.ax_btn_disp, 'Calculate Displacements')
+        self.btn_disp.on_clicked(self.on_calc_displacement)
+
+        # Start reconstruction button
+        self.ax_btn_recon = self.fig.add_axes([0.7, btn_y, btn_width, btn_height])
+        self.btn_recon = Button(self.ax_btn_recon, 'Start PSI Reconstruction')
+        self.btn_recon.on_clicked(self.on_start_reconstruction)
+
+        # Save result button
+        self.ax_btn_save = self.fig.add_axes([0.4, btn_y + btn_height + 0.01, btn_width, btn_height])
+        self.btn_save = Button(self.ax_btn_save, 'Save Reconstruction Result')
+        self.btn_save.on_clicked(self.on_save_result)
+
+        # Parameter setting area
+        param_y = 0.75
+        param_height = 0.2
+        param_width = 0.15
+
+        # Segmentation factor selection
+        self.ax_radio_sr = self.fig.add_axes([0.02, param_y, param_width, param_height])
+        self.radio_sr = RadioButtons(self.ax_radio_sr, ('2x Segmentation', '3x Segmentation', '4x Segmentation'))
+        self.radio_sr.set_active(2)  # Default 4x
+        self.radio_sr.on_clicked(self.on_sr_change)
+        self.ax_radio_sr.set_title('Segmentation Factor')
+
+        # Post-processing options
+        self.ax_radio_post = self.fig.add_axes([0.83, param_y, param_width, param_height])
+        self.radio_post = RadioButtons(self.ax_radio_post, ('Border Clipping', 'Gaussian Filtering'))
+        # Fix: Set active one by one instead of passing a list
+        self.radio_post.set_active(0)  # Enable Border Clipping
+        self.radio_post.set_active(1)  # Enable Gaussian Filtering
+        self.radio_post.on_clicked(self.on_post_change)
+        self.ax_radio_post.set_title('Post-processing Options')
+
+        # Adjust layout
+        plt.tight_layout(rect=[0, 0.2, 1, 1])
+
+    def update_status(self, text):
+        """Update status text"""
+        config.status = text
+        self.status_text.set_text(text)
+        self.fig.canvas.draw_idle()
+
+    def update_progress(self, progress):
+        """Update progress bar"""
+        self.progress_bar.set_width(progress)
+        self.update_status(f"Processing... {progress:.1f}%")
+        self.fig.canvas.draw_idle()
+
+    def on_load_images(self, event):
+        """Load image sequence"""
+        root = tk.Tk()
+        root.withdraw()
+        folder = filedialog.askdirectory(title="Select Image Folder")
+        root.destroy()
+
+        if folder:
+            try:
+                self.update_status(f"Loading image sequence: {os.path.basename(folder)}")
+                h, w = self.reconstructor.load_image_sequence(folder)
+
+                # Display reference image
+                ref_img = self.reconstructor.ref_img
+                self.ax_original.imshow(ref_img.numpy(), cmap='gray')
+                self.ax_original.axis('off')
+
+                # Display ROI region
+                roi_img = self.reconstructor.data_processor.crop_image(ref_img, config.roi)
+                self.ax_roi.imshow(roi_img.numpy(), cmap='gray')
+                self.ax_roi.axis('off')
+
+                self.fig.canvas.draw_idle()
+                self.update_status(f"Loaded {len(self.reconstructor.img_files)} frames, size: {w}x{h}")
+            except Exception as e:
+                self.update_status(f"Loading failed: {str(e)}")
+
+    def on_select_roi(self, event):
+        """Select ROI region"""
+        if self.reconstructor.ref_img is None:
+            self.update_status("Please load image sequence first")
+            return
+
+        self.update_status("Drag mouse on original image to select ROI, press Enter to confirm")
+
+        # Display original image
+        ref_img = self.reconstructor.ref_img
+        self.ax_original.imshow(ref_img.numpy(), cmap='gray')
+        self.ax_original.axis('on')
+        self.fig.canvas.draw_idle()
+
+        # Create ROI selector
+        def on_roi_select(eclick, erelease):
+            x1, y1 = int(eclick.xdata), int(eclick.ydata)
+            x2, y2 = int(erelease.xdata), int(erelease.ydata)
+            config.roi = [x1, y1, x2 - x1, y2 - y1]
+
+            # Display selected ROI
+            roi_img = self.reconstructor.data_processor.crop_image(ref_img, config.roi)
+            self.ax_roi.imshow(roi_img.numpy(), cmap='gray')
+            self.ax_roi.axis('off')
+
+            self.update_status(f"ROI selected: x={x1}, y={y1}, w={x2 - x1}, h={y2 - y1}")
+
+        self.roi_selector = RectangleSelector(
+            self.ax_original, on_roi_select,
+            drawtype='box', useblit=True,
+            button=[1], minspanx=5, minspany=5,
+            spancoords='pixels', interactive=True
+        )
+
+    def on_calc_displacement(self, event):
+        """Calculate inter-frame displacements"""
+        if self.reconstructor.img_array is None:
+            self.update_status("Please load image sequence first")
+            return
+
+        try:
+            self.update_status("Calculating inter-frame displacements...")
+            self.reconstructor.index_array = self.reconstructor.displacement_calc.calculate_all_displacements(
+                self.reconstructor.img_array, config.ref_frame_idx
+            )
+
+            # Visualize displacements
+            displacements = self.reconstructor.index_array.numpy()
+            self.ax_displacement.clear()
+            self.ax_displacement.plot(displacements[:, 0], label='X displacement')
+            self.ax_displacement.plot(displacements[:, 1], label='Y displacement')
+            self.ax_displacement.legend()
+            self.ax_displacement.grid(True)
+            self.ax_displacement.set_title("Inter-frame Displacement")
+
+            self.fig.canvas.draw_idle()
+            self.update_status(f"Displacement calculation completed, {len(displacements)} frames total")
+        except Exception as e:
+            self.update_status(f"Displacement calculation failed: {str(e)}")
+
+    def on_start_reconstruction(self, event):
+        """Start PSI reconstruction"""
+        if self.reconstructor.img_array is None:
+            self.update_status("Please load image sequence first")
+            return
+
+        try:
+            self.update_status("Starting pixel segmentation reconstruction...")
+            self.progress_bar.set_width(0)
+
+            # Define progress callback function
+            def progress_callback(progress):
+                self.update_progress(progress)
+
+            # Execute reconstruction
+            result = self.reconstructor.run_reconstruction(progress_callback)
+
+            if result is not None:
+                # Display reconstruction result
+                self.ax_result.imshow(result.numpy(), cmap='gray')
+                self.ax_result.axis('off')
+                self.fig.canvas.draw_idle()
+
+                self.update_progress(100)
+                self.update_status(
+                    f"PSI reconstruction completed! Processing time: {config.processing_time:.2f}s, "
+                    f"Result size: {result.shape[1]}x{result.shape[0]}"
+                )
+        except Exception as e:
+            self.update_status(f"Reconstruction failed: {str(e)}")
+
+    def on_save_result(self, event):
+        """Save reconstruction result"""
+        if self.reconstructor.psi_result is None:
+            self.update_status("Please complete reconstruction first")
+            return
+
+        root = tk.Tk()
+        root.withdraw()
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".tif",
+            filetypes=[("TIFF files", "*.tif"), ("All files", "*.*")],
+            title="Save Reconstruction Result"
+        )
+        root.destroy()
+
+        if save_path:
+            success = self.reconstructor.data_processor.save_image(
+                self.reconstructor.psi_result, save_path
+            )
+            if success:
+                self.update_status(f"Result saved to: {save_path}")
+            else:
+                self.update_status("Saving failed")
+
+    def on_sr_change(self, label):
+        """Segmentation factor change"""
+        if label == '2x Segmentation':
+            config.sr_factor = 2
+        elif label == '3x Segmentation':
+            config.sr_factor = 3
+        else:
+            config.sr_factor = 4
+        self.update_status(f"Selected: {label}")
+
+    def on_post_change(self, label):
+        """Post-processing options change"""
+        if label == 'Border Clipping':
+            config.border_threshold = 1 - config.border_threshold
+        elif label == 'Gaussian Filtering':
+            config.gaussian_filter = 1 - config.gaussian_filter
+        status = []
+        if config.border_threshold:
+            status.append("Border clipping enabled")
+        if config.gaussian_filter:
+            status.append("Gaussian filtering enabled")
+        self.update_status(", ".join(status))
+
+    def run(self):
+        """Run GUI"""
+        plt.show()
+
+
+# -------------------------- Main Program Entry --------------------------
+if __name__ == "__main__":
+    print("Pixel Segmentation Reconstruction (PSI) System starting...")
+    gui = PSIGUI()
+    gui.run()
