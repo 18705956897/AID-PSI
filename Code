@@ -26,7 +26,7 @@ class Config:
         self.start_num = 1
         self.end_num = 16
         self.ref_frame_idx = 6  # Reference frame index
-        self.roi = [0, 0, 200, 200]  # [x, y, w, h]
+        self.roi = [0, 0, 320, 256]  # [x, y, w, h]
 
         # Evolutionary algorithm parameters
         self.pop_size = 100
@@ -146,7 +146,7 @@ class QEDataHandler:
 
     def generate_simulated_qe_data(self):
         """Generate simulated QE data"""
-        sizes = {4: (1024, 1024), 3: (768, 768), 2: (512, 512)}
+        sizes = {4: (1024, 1280), 3: (768, 960), 2: (512, 640)}
         for factor in sizes:
             h, w = sizes[factor]
             # Generate base pattern with random noise
